@@ -1,32 +1,3 @@
-"""
-DEBUGGED, CONVENTION-CONSISTENT PINN
-Cantilever Euler–Bernoulli beam with tip point load
-Outputs: deflection w(x), rotation theta(x), bending moment M(x), shear force V(x)
-
-Key fixes vs your earlier runs
-------------------------------
-1) One single sign convention everywhere:
-   - Downward tip load: P_load = -abs(P)
-   - Deflection w(x) follows P_load (downward = negative)
-2) Nondimensionalization:
-   xi = x/L in [0,1]
-   w = w_ref * wbar, where w_ref = |P| L^3 / EI  (positive scaling)
-3) Hard clamp BCs (at x=0) enforced by construction:
-   wbar(xi) = xi^2 * N(xi)  => wbar(0)=0 and wbar'(0)=0 automatically
-4) Correct tip load BC in nondimensional form:
-   From:  -EI w'''(L) = P_load
-   With:  w = w_ref wbar, x=L xi, w_ref=|P|L^3/EI  =>  -|P| wbar'''(1) = P_load
-   So:    wbar'''(1) = -P_load/|P|  ( = +1 for downward, -1 for upward )
-5) Robust internal forces:
-   - Moment computed from w'':   M = -EI w''
-   - Shear computed from dM/dx:  V = dM/dx   (much more stable than using w''')
-     This eliminates the oscillatory shear you saw.
-
-Requirements
------------
-pip install torch matplotlib numpy
-"""
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -257,3 +228,4 @@ plt.grid(True)
 plt.legend()
 
 plt.show()
+
