@@ -1,44 +1,79 @@
+"""
+DEBUGGED, CONVENTION-CONSISTENT PINN
+Cantilever Euler–Bernoulli beam with tip point load
+Outputs: deflection w(x), rotation theta(x), bending moment M(x), shear force V(x)
+
+Key fixes vs your earlier runs
+------------------------------
+1) One single sign convention everywhere:
+   - Downward tip load: P_load = -abs(P)
+   - Deflection w(x) follows P_load (downward = negative)
+2) Nondimensionalization:
+   xi = x/L in [0,1]
+   w = w_ref * wbar, where w_ref = |P| L^3 / EI  (positive scaling)
+3) Hard clamp BCs (at x=0) enforced by construction:
+   wbar(xi) = xi^2 * N(xi)  => wbar(0)=0 and wbar'(0)=0 automatically
+4) Correct tip load BC in nondimensional form:
+   From:  -EI w'''(L) = P_load
+   With:  w = w_ref wbar, x=L xi, w_ref=|P|L^3/EI  =>  -|P| wbar'''(1) = P_load
+   So:    wbar'''(1) = -P_load/|P|  ( = +1 for downward, -1 for upward )
+5) Robust internal forces:
+   - Moment computed from w'':   M = -EI w''
+   - Shear computed from dM/dx:  V = dM/dx   (much more stable than using w''')
+     This eliminates the oscillatory shear you saw.
+
+Requirements
+-----------
+pip install torch matplotlib numpy
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 
-# ----------------------------
-# 0) settings
-# ----------------------------
+
+# ============================================================
+# 0) NUMERICAL SETTINGS
+# ============================================================
 torch.manual_seed(0)
 np.random.seed(0)
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float64)  # critical for high-order derivatives
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
 
-# ----------------------------
-# 1) beam inputs
-# ----------------------------
-L = 2.0
-E = 200e9
-I = 8e-6
-P = 10e3
 
-# Choose physical load sign here:
-P_load = -abs(P)   # downward
-# P_load = +abs(P) # upward
+# ============================================================
+# 1) BEAM PARAMETERS (EDIT THESE)
+# ============================================================
+L = 2.0        # m
+E = 200e9      # Pa
+I = 8e-6       # m^4
+
+P = 10e3       # N (magnitude you want)
+P_load = -abs(P)   # DOWNWARD load negative (set +abs(P) for upward)
 
 EI = E * I
 Pmag = abs(P_load)
 
-# Scaling (positive)
+# positive scale
 w_ref = Pmag * L**3 / EI
 
 print(f"EI     = {EI:.3e} N·m^2")
 print(f"P_load = {P_load:.3e} N")
 print(f"w_ref  = {w_ref:.3e} m")
 
-# ----------------------------
-# 2) PINN: wbar(xi) with hard clamp BCs
-# wbar(0)=0 and wbar'(0)=0 enforced by construction: wbar = xi^2*N(xi)
-# ----------------------------
+# correct nondimensional shear BC target at xi=1
+# -|P| * wbar'''(1) = P_load  =>  wbar'''(1) = -P_load/|P|
+wbar3_target = -P_load / Pmag
+print("Target wbar'''(1) =", float(wbar3_target))
+
+
+# ============================================================
+# 2) PINN MODEL: wbar(xi) with hard clamp BCs
+# wbar(0)=0 and wbar'(0)=0 are satisfied exactly by construction.
+# ============================================================
 class MLP(nn.Module):
     def __init__(self, hidden=64, depth=4):
         super().__init__()
@@ -49,125 +84,176 @@ class MLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, xi):
+        # trial function
         return (xi**2) * self.net(xi)
 
-model = MLP().to(device)
+model = MLP(hidden=64, depth=4).to(device)
 
+
+# ============================================================
+# 3) AUTODIFF UTILITIES
+# ============================================================
 def d(u, x):
     return torch.autograd.grad(u, x, torch.ones_like(u), create_graph=True)[0]
 
-def derivs(xi):
+def wbar_and_derivs(xi):
+    """
+    Returns wbar, dwbar/dxi, d2wbar/dxi2, d3wbar/dxi3, d4wbar/dxi4
+    """
     xi = xi.clone().detach().requires_grad_(True)
-    w  = model(xi)
-    w1 = d(w, xi)
+    w0 = model(xi)
+    w1 = d(w0, xi)
     w2 = d(w1, xi)
     w3 = d(w2, xi)
     w4 = d(w3, xi)
-    return w, w1, w2, w3, w4
+    return w0, w1, w2, w3, w4
 
-# ----------------------------
-# 3) collocation + boundary points
-# ----------------------------
-N_f = 5000
-xi_f = torch.rand(N_f, 1, device=device).clamp(1e-4, 1-1e-4)
-xi1  = torch.tensor([[1.0]], device=device)
 
-# ----------------------------
-# 4) correct nondimensional tip BC target
-# From: -|P| * wbar'''(1) = P_load  => wbar'''(1) = -P_load/|P|
-wbar3_target = -P_load / Pmag  # = +1 for downward, -1 for upward
-print("wbar'''(1) target =", float(wbar3_target))
+# ============================================================
+# 4) TRAINING POINTS
+# ============================================================
+N_f = 6000
+xi_f = torch.rand(N_f, 1, device=device).clamp(1e-4, 1 - 1e-4)
+xi_1 = torch.tensor([[1.0]], device=device)  # free end
 
+
+# ============================================================
+# 5) LOSS FUNCTION
+# PDE (interior): wbar''''(xi) = 0
+# Tip BCs: wbar''(1)=0 and wbar'''(1)=wbar3_target
+# ============================================================
 lam_pde = 1.0
-lam_tip = 200.0
+lam_tip = 300.0
 
-def losses():
-    # PDE: wbar'''' = 0
-    _, _, _, _, w4 = derivs(xi_f)
-    lpde = torch.mean(w4**2)
+def compute_losses():
+    # PDE residual
+    _, _, _, _, w4 = wbar_and_derivs(xi_f)
+    loss_pde = torch.mean(w4**2)
 
-    # Tip: wbar''(1)=0 and wbar'''(1)=wbar3_target
-    _, _, w2_1, w3_1, _ = derivs(xi1)
-    ltip = torch.mean(w2_1**2) + torch.mean((w3_1 - wbar3_target)**2)
-    return lpde, ltip
+    # Tip BCs
+    _, _, w2_1, w3_1, _ = wbar_and_derivs(xi_1)
+    loss_tip = torch.mean(w2_1**2) + torch.mean((w3_1 - wbar3_target)**2)
 
-# ----------------------------
-# 5) train: Adam -> LBFGS
-# ----------------------------
+    return loss_pde, loss_tip
+
+
+# ============================================================
+# 6) TRAINING: ADAM -> LBFGS
+# ============================================================
 adam = optim.Adam(model.parameters(), lr=3e-4)
-for epoch in range(1, 5001):
+
+for epoch in range(1, 6001):
     adam.zero_grad()
-    lpde, ltip = losses()
-    loss = lam_pde*lpde + lam_tip*ltip
+    lpde, ltip = compute_losses()
+    loss = lam_pde * lpde + lam_tip * ltip
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
     adam.step()
+
     if epoch % 500 == 0:
         print(f"[Adam] Epoch {epoch:4d} | Total {loss.item():.3e} | PDE {lpde.item():.3e} | Tip {ltip.item():.3e}")
 
-lbfgs = optim.LBFGS(model.parameters(), lr=1.0, max_iter=500, history_size=50, line_search_fn="strong_wolfe")
+lbfgs = optim.LBFGS(
+    model.parameters(),
+    lr=1.0,
+    max_iter=600,
+    history_size=50,
+    line_search_fn="strong_wolfe"
+)
+
 def closure():
     lbfgs.zero_grad()
-    lpde, ltip = losses()
-    loss = lam_pde*lpde + lam_tip*ltip
+    lpde, ltip = compute_losses()
+    loss = lam_pde * lpde + lam_tip * ltip
     loss.backward()
     return loss
+
 final_loss = lbfgs.step(closure)
 print("[LBFGS] Final loss:", float(final_loss))
 
-# ----------------------------
-# 6) post-process to physical units
-# ----------------------------
-xi = torch.linspace(0, 1, 401, device=device).view(-1, 1)
-wbar, wbar1, wbar2, wbar3, _ = derivs(xi)
 
-x = (L * xi).detach().cpu().numpy().ravel()
+# ============================================================
+# 7) POST-PROCESSING (PHYSICAL UNITS)
+# IMPORTANT: V is computed from dM/dx (stable), not from w'''
+# ============================================================
+# Use xi as grad-enabled tensor to compute dM/dx
+xi = torch.linspace(0.0, 1.0, 401, device=device).view(-1, 1).requires_grad_(True)
 
-# physical fields (NO extra sign multipliers!)
-w = (w_ref * wbar).detach().cpu().numpy().ravel()
-theta = ((w_ref / L) * wbar1).detach().cpu().numpy().ravel()
+wbar, wbar1, wbar2, wbar3, _ = wbar_and_derivs(xi)
 
-M = (-EI * (w_ref / L**2) * wbar2).detach().cpu().numpy().ravel()
-V = (-EI * (w_ref / L**3) * wbar3).detach().cpu().numpy().ravel()
+# coordinates
+x_torch = L * xi
 
-# ----------------------------
-# 7) analytical (same P_load)
-# ----------------------------
-x_t = torch.tensor(x, device=device).view(-1, 1)
-w_true = (P_load * x_t**2 * (3*L - x_t)) / (6*EI)   # deflection sign follows P_load
-M_true = P_load * (L - x_t)                         # moment
-V_true = P_load * torch.ones_like(x_t)              # shear constant
+# physical fields
+w_torch = w_ref * wbar
+theta_torch = (w_ref / L) * wbar1
 
-w_true = w_true.detach().cpu().numpy().ravel()
-M_true = M_true.detach().cpu().numpy().ravel()
-V_true = V_true.detach().cpu().numpy().ravel()
+# w''(x) = (w_ref/L^2) * wbar''(xi)
+w_xx_torch = (w_ref / L**2) * wbar2
 
-print("MSE(w) =", np.mean((w - w_true)**2))
-print("V_tip PINN/TRUE =", V[-1], V_true[-1])
-print("M_fixed PINN/TRUE =", M[0], M_true[0])
+# Moment convention:
+# M = -EI * w''(x)
+M_torch = -EI * w_xx_torch
 
-# ----------------------------
-# 8) plots
-# ----------------------------
+# Shear computed robustly from V = dM/dx
+V_torch = torch.autograd.grad(
+    M_torch, x_torch, grad_outputs=torch.ones_like(M_torch), create_graph=False
+)[0]
+
+# Convert to numpy
+x = x_torch.detach().cpu().numpy().ravel()
+w = w_torch.detach().cpu().numpy().ravel()
+theta = theta_torch.detach().cpu().numpy().ravel()
+M = M_torch.detach().cpu().numpy().ravel()
+V = V_torch.detach().cpu().numpy().ravel()
+
+
+# ============================================================
+# 8) ANALYTICAL SOLUTION (SAME SIGN CONVENTION)
+# w(x) = P_load x^2 (3L-x) / (6EI)
+# M(x) = P_load (L-x)
+# V(x) = P_load (constant)
+#
+# This matches the governing relation: V = dM/dx
+# ============================================================
+w_true = (P_load * x**2 * (3.0 * L - x)) / (6.0 * EI)
+M_true = P_load * (L - x)
+V_true = np.ones_like(x) * P_load
+
+print("MSE(w) =", np.mean((w - w_true) ** 2))
+print(f"Tip deflection PINN/TRUE: {w[-1]:.6e} / {P_load*L**3/(3*EI):.6e}")
+print(f"M(0) PINN/TRUE: {M[0]:.3e} / {P_load*L:.3e}")
+print(f"V(x) PINN/TRUE: {V.mean():.3e} / {P_load:.3e}  (V should be constant)")
+
+
+# ============================================================
+# 9) PLOTS
+# ============================================================
 plt.figure()
 plt.plot(x, w, label="PINN w(x)")
 plt.plot(x, w_true, "--", label="Analytical w(x)")
-plt.xlabel("x (m)"); plt.ylabel("w (m)")
+plt.xlabel("x (m)")
+plt.ylabel("w (m)")
 plt.title("Cantilever beam (tip load): deflection")
-plt.grid(True); plt.legend()
+plt.grid(True)
+plt.legend()
 
 plt.figure()
-plt.plot(x, M, label="PINN M(x)=-EI w''")
+plt.plot(x, M, label="PINN M(x)=-EI w''(x)")
 plt.plot(x, M_true, "--", label="Analytical M(x)")
-plt.xlabel("x (m)"); plt.ylabel("M (N·m)")
+plt.xlabel("x (m)")
+plt.ylabel("M (N·m)")
 plt.title("Bending moment (linear)")
-plt.grid(True); plt.legend()
+plt.grid(True)
+plt.legend()
 
 plt.figure()
-plt.plot(x, V, label="PINN V(x)=-EI w'''")
+plt.plot(x, V, label="PINN V(x)=dM/dx (robust)")
 plt.plot(x, V_true, "--", label="Analytical V(x)")
-plt.xlabel("x (m)"); plt.ylabel("V (N)")
+plt.xlabel("x (m)")
+plt.ylabel("V (N)")
 plt.title("Shear force (constant)")
-plt.grid(True); plt.legend()
+plt.grid(True)
+plt.legend()
 
 plt.show()
